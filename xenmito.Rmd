@@ -7,6 +7,8 @@ output: html_document
 ## Introduction
 
 This script automates the analysis of a set of long read sequences (nanopore) with the aim to analyse the fraction of mitochondrial reads and to identify mitochondrial variants.
+
+Please read https://www.biorxiv.org/content/10.1101/2019.12.20.884486v1
  
 ## Computing requirements
 
