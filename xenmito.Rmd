@@ -1,7 +1,7 @@
 ---
 title: "XENMITO"
 author: "N. Pollet"
-date: "18/05/2020"
+date: "31/07/2020"
 output: html_document
 ---
 ## Introduction
@@ -10,6 +10,8 @@ This script automates the analysis of a set of long read sequences (nanopore) wi
 
 Please read https://www.biorxiv.org/content/10.1101/2019.12.20.884486v1
  
+Currently for your eyes only !!
+
 ## Computing requirements
 
  This script will require enough computing resources (essentially storage space) to run the analysis of one or several minion sequencing run, typically 10-20 Gbp of raw reads per run. It is meant to be used on a workstation or on a computing cluster under a Unix environment accessed by a flavour of bash.
@@ -83,7 +85,10 @@ Please read https://www.biorxiv.org/content/10.1101/2019.12.20.884486v1
         
     - one file with the mitochondrial reference genome in fasta format (not pseudo_circularised)
      
-    - one file with the mitochondrial reference genome in bed format.
+    - one file with the pseudo_circularised mitochondrial reference genome in bed format as follows:
+```
+MN259069.1	1	35400	RefSeq	0	+
+```    
         Please ensure that the accession number of the mitochondrial reference genome is the same across these three files.
 
     - Now you can edit a text file as follows:
@@ -124,16 +129,22 @@ During the execution of the script, a few messages are printed on STDOUT. A proj
         -read length
         -read quality (phred score)
         -read mapping (nucDNA or mtDNA)
-        -read sequence file
+
+- starting_raw_seq_mtDNA_dir contains fastq read sequence files for reads mapping to mtDNA
     
 - starting_raw_seq_long_mtDNA_reads_dir contains 
     - *.long_mtDNA_reads.ids
     - *.long_mtDNA_reads.info 
-    - *.small.long_mtDNA_reads.fasta : fasta file of reads covering more than 8000 nt of mtDNA
-    - *.very.long_mtDNA_reads.fasta : fasta file of reads covering more than 8000 nt of mtDNA
+    - *.small.long_mtDNA_reads.fasta : fasta file of reads covering more than half of the reference mtDNA
+    - *.very.long_mtDNA_reads.fasta : fasta file of reads covering more than haf of the reference mtDNA
     
 - starting_raw_seq_mapping_ref_dir
-
+    - *.mtDNA.sorted.bam : bam files produced by mapping on the reference mtDNA
+    - *.mtDNA.sorted.bam.bai: corresponding bam indices
+    - medaka_dir : sub-directory containing medaka outputs
+      -barcode*.medaka_variant : sub-directories containing medaka output for each barcode in the form of vcf files
+      -final_vcf_dir : all renamed medaka vcf results
+      
 ## Script
 
 ```{r setup, include=FALSE}
@@ -183,8 +194,10 @@ export MY_VCFTOOLS="vcf-annotate"
 #minimap2 --version
 #bedtools --version
 #bioawk
+#seqtk
 #htsbox
 #medaka_variant
+
 
 # Check the invocation
 if [[ $# != 2 ]]; then
@@ -207,7 +220,7 @@ for i in "$@"; do
 done
 
 
-if [[ -f $CONFIG_FILE ]]; do
+if [[ -f $CONFIG_FILE ]]; then
 source $CONFIG_FILE
 else
     echo " I can not find the config file"
@@ -253,7 +266,7 @@ fi
 
 # Define the path to the reference mitochondrial genome in fasta format to call variants
 #HERE Edit the following line to specify the file name you want to use
-export MY_MTDNA_REF=$(realpath ${DBPATH}/$MITO_FASTA)
+export MY_MTDNA_REF=$(realpath ${DBPATH}/${MITO_FASTA})
 if [[ -f $MY_MTDNA_REF ]]; then
     echo "I found the reference mitochondrial genome in fasta format at " $MY_MTDNA_REF
     else
@@ -263,7 +276,7 @@ fi
 
 # Define the path to the reference mitochondrial genome as a bed file
 #HERE Edit the following line to specify the file name you want to use
-export MY_MTDNA_REF_BED=$(realpath ${DBPATH}/$MITO_BED)
+export MY_MTDNA_REF_BED=$(realpath ${DBPATH}/${MITO_BED})
 if [[ -f $MY_MTDNA_REF_BED ]]; then
     echo "I found the reference mitochondrial genome in bed format at " $MY_MTDNA_REF_BED
     else
@@ -311,67 +324,82 @@ fi
 
 # A first analysis is to quantify the proportion of mitochondrial reads vs nuclear reads
 # Step 1: Mapping against the reference nuclear genome
-for seqfile in "${START_SEQ_DIR}"/*."${FQEXTENSION}"; do
-# Checking the fastq sequences for redundancy. In addition, if bioawk can format them then they are corectly formatted.
-    bioawk -c fastx '!x[$0]++ {print "@"$name"\n"$seq"\n+\n"$qual}' $seqfile > tmp_seq_file.fastq
-    N_SEQ_START=$(grep -c "^@" $seqfile)
-    N_SEQ_END=$(grep -c "^@" tmp_seq_file.fastq)
-    if [[ $N_SEQ_START != $N_SEQ_END ]]; then
-        echo "Redundancy problem encountered with $seqfile"
-    fi
-echo "Step 1 : Mapping $seqfile against $REF_NUC_GENOME..."
-    # 1.1-extract the base name by removing fastq
-    base=$(basename $seqfile ."${FQEXTENSION}")
-    outmapfile=$(echo $base".aln.sam")
-    # 1.2-run minimap2 using --secondary=no to suppress multiple mappings
-    ${MY_MINIMAP2} --secondary=no -t 48 -a ${REF_NUC_GENOME} tmp_seq_file.fastq > ${MAPPING_DIR}/$outmapfile
-    rm tmp_seq_file.fastq
-done
+
+if ! (( $(grep -c "Step1 completed" ${PROJECT_DIR}/progress.log) )) ; then
+    for seqfile in "${START_SEQ_DIR}"/*."${FQEXTENSION}"; do
+    # Checking the fastq sequences for redundancy. In addition, if bioawk can format them then they are corectly formatted.
+        bioawk -c fastx '!x[$0]++ {print "@"$name"\n"$seq"\n+\n"$qual}' $seqfile > tmp_seq_file.fastq
+       N_SEQ_START=$(grep -c "^@" $seqfile)
+       N_SEQ_END=$(grep -c "^@" tmp_seq_file.fastq)
+       if [[ $N_SEQ_START != $N_SEQ_END ]]; then
+           echo "Redundancy problem encountered with $seqfile"
+       fi
+       echo "Step 1 : Mapping $seqfile against $REF_NUC_GENOME..."
+       # 1.1-extract the base name by removing fastq
+       base=$(basename $seqfile ."${FQEXTENSION}")
+       outmapfile=$(echo $base".aln.sam")
+       # 1.2-run minimap2 using --secondary=no to suppress multiple mappings
+       ${MY_MINIMAP2} --secondary=no -t 48 -a ${REF_NUC_GENOME} tmp_seq_file.fastq > ${MAPPING_DIR}/$outmapfile
+       rm tmp_seq_file.fastq
+    done
+# Logging progress
+echo "Step1 completed" >> ${PROJECT_DIR}/progress.log
+fi
 
 # Step 2: Counting the matches to mtDNA
-for samfile in ${MAPPING_DIR}/barcode*.sam; do
-    # 2.1 extract the base name by removing .sam
-    base=$(basename $samfile .aln.sam)
-echo "Step 2 : Counting the matches to mtDNA for " $base
+if ! (( $(grep -c "Step2.6 completed" ${PROJECT_DIR}/progress.log) )) ; then
+    for samfile in ${MAPPING_DIR}/barcode*.sam; do
+        # 2.1 extract the base name by removing .sam
+        base=$(basename $samfile .aln.sam)
+        echo "Step 2 : Counting the matches to mtDNA for " $base
 
-    # 2.2 use samtools view to count primary mappings to the mtDNA sequence
-    mito_count=$(${MY_SAMTOOLS} view -c -L $MY_MTDNA_REF_BED $samfile)
+        # 2.2 use samtools view to count primary mappings to the mtDNA sequence
+        mito_count=$(${MY_SAMTOOLS} view -c -L $MY_MTDNA_REF_BED $samfile)
 
-    # 2.3 Recover mitochondrial DNA matching read's identifiers - Note the use of sort to make it unique
-    ${MY_SAMTOOLS} view -L $MY_MTDNA_REF_BED $samfile | awk '{print $1}' | sort -u > ${MAPPING_DIR}/$base.matchmtDNA.ids
+        # 2.3 Recover mitochondrial DNA matching read's identifiers - Note the use of sort to make it unique
+        ${MY_SAMTOOLS} view -L $MY_MTDNA_REF_BED $samfile | awk '{print $1}' | sort -u > ${MAPPING_DIR}/$base.matchmtDNA.ids
 
-    # 2.4 use samtools view to count all primary mappings
-    all_count=$(${MY_SAMTOOLS} view -c  $samfile)
+        # 2.4 use samtools view to count all primary mappings
+        all_count=$(${MY_SAMTOOLS} view -c  $samfile)
 
-    # 2.5 do the arithmetics to count non-mtDNA mappings
-    let nuc_count="$all_count - $mito_count"
+        # 2.5 do the arithmetics to count non-mtDNA mappings
+        let nuc_count="$all_count - $mito_count"
 
-    # 2.6 output the counts to an output file
-    printf "%-10s %7d %7d %7d\n" $base $all_count $nuc_count $mito_count > ${MAPPING_DIR}/$base.full.count
-done
+        # 2.6 output the counts to an output file
+        printf "%-10s %7d %7d %7d\n" $base $all_count $nuc_count $mito_count > ${MAPPING_DIR}/$base.full.count
+    done
 
-# Edit a header and collect counting results in a single file
-echo "name all_count nuc_count mito_count" > ${MAPPING_DIR}/mapping_stats.txt
-cat ${MAPPING_DIR}/*.full.count >> ${MAPPING_DIR}/mapping_stats.txt
+    # Edit a header and collect counting results in a single file
+    echo "name all_count nuc_count mito_count" > ${MAPPING_DIR}/mapping_stats.txt
+    cat ${MAPPING_DIR}/*.full.count >> ${MAPPING_DIR}/mapping_stats.txt
+
+    # Logging progress
+    echo "Step2.6 completed" >> ${PROJECT_DIR}/progress.log
+fi
 
 #  2.7 prepare a sorted bam index to compute the coverage
-for samfile in ${MAPPING_DIR}/barcode*.sam; do
-    base=$(basename $samfile .aln.sam)
-    bamfile=$(echo $base".sorted.bam")
-    ${MY_SAMTOOLS} view -@ 24 -bS $samfile | ${MY_SAMTOOLS} sort -  -m 4G -@ 24 -o ${MAPPING_DIR}/$bamfile
-    ${MY_SAMTOOLS} index -m 4G -@ 24 ${MAPPING_DIR}/$bamfile
-    # 2.8 compute coverage
-    pos_coverage_bedfile=$(echo $base"_coverage_pos.bed")
-    neg_coverage_bedfile=$(echo $base"_coverage_neg.bed")
-    #unstranded
-    coverage_bedfile=$(echo $base"_coverage.bed")
-    bedtools coverage -a $MY_MTDNA_REF_BED -b ${MAPPING_DIR}/$bamfile -bed -d -s > ${MAPPING_DIR}/$pos_coverage_bedfile
-    bedtools coverage -a $MY_MTDNA_REF_BED -b ${MAPPING_DIR}/$bamfile -bed -d -S > ${MAPPING_DIR}/$neg_coverage_bedfile
-    bedtools coverage -a $MY_MTDNA_REF_BED -b ${MAPPING_DIR}/$bamfile -bed -d > ${MAPPING_DIR}/$coverage_bedfile
-done
+if ! (( $(grep -c "Step2.7 completed" ${PROJECT_DIR}/progress.log) )) ; then
 
-# Clean up the sam files
-rm ${MAPPING_DIR}/*.sam
+    for samfile in ${MAPPING_DIR}/barcode*.sam; do
+        base=$(basename $samfile .aln.sam)
+        bamfile=$(echo $base".sorted.bam")
+        ${MY_SAMTOOLS} view -@ 24 -bS $samfile | ${MY_SAMTOOLS} sort -  -m 4G -@ 24 -o ${MAPPING_DIR}/$bamfile
+        ${MY_SAMTOOLS} index -b -m 4G -@ 24 ${MAPPING_DIR}/$bamfile
+        # 2.8 compute coverage
+        pos_coverage_bedfile=$(echo $base"_coverage_pos.bed")
+        neg_coverage_bedfile=$(echo $base"_coverage_neg.bed")
+        #unstranded
+        coverage_bedfile=$(echo $base"_coverage.bed")
+        bedtools coverage -a $MY_MTDNA_REF_BED -b ${MAPPING_DIR}/$bamfile -bed -d -s > ${MAPPING_DIR}/$pos_coverage_bedfile
+        bedtools coverage -a $MY_MTDNA_REF_BED -b ${MAPPING_DIR}/$bamfile -bed -d -S > ${MAPPING_DIR}/$neg_coverage_bedfile
+        bedtools coverage -a $MY_MTDNA_REF_BED -b ${MAPPING_DIR}/$bamfile -bed -d > ${MAPPING_DIR}/$coverage_bedfile
+    done
+    # Clean up the sam files
+    rm ${MAPPING_DIR}/*.sam
+
+    # Logging progress
+    echo "Step2.7 completed" >> ${PROJECT_DIR}/progress.log
+fi
 
 # rm ${MAPPING_DIR}/*.full.count
 
@@ -384,16 +412,34 @@ if [[ -d starting_raw_seq_stats_dir ]]; then
     mkdir -p $PROJECT_DIR/starting_raw_seq_stats_dir
     export READS_STATS_DIR=${PROJECT_DIR}/starting_raw_seq_stats_dir
 fi
+
 # Collecting all required informations
-for seqfile in ${START_SEQ_DIR}/*."${FQEXTENSION}"; do
-    # 3.1 extract the base name by removing .fastq
-    base=$(basename $seqfile ."${FQEXTENSION}")
-echo "Step 3: " $base
-    outstatfile=$(echo $base".seqlenqual.txt")
-    # 3.2 extract read name, size, mean quality, add mapping information : mtDNA or nuclear and barcode of origin
-    mtDNA_id_infile=$(echo ${MAPPING_DIR}/$base.matchmtDNA.ids)
-    bioawk -v match_file="$mtDNA_id_infile" -c fastx 'BEGIN {while ((getline k <match_file)>0)i[k]=1} {if(i[$name]) print $name," ",length($seq)," ",meanqual($qual)," mtDNA"; else print $name," ",length($seq)," ",meanqual($qual)," nucDNA"}' $seqfile | sed -e "s/$/ $base/" > ${READS_STATS_DIR}/$outstatfile
-done
+# We will store mtDNA read files in a separate directory
+if [[ -d starting_raw_seq_mtDNA_dir ]]; then
+export READS_MTDNA_DIR=${PROJECT_DIR}/starting_raw_seq_mtDNA_dir
+else
+mkdir -p $PROJECT_DIR/starting_raw_seq_mtDNA_dir
+export READS_MTDNA_DIR=${PROJECT_DIR}/starting_raw_seq_mtDNA_dir
+fi
+
+if ! (( $(grep -c "Step3.3 completed" ${PROJECT_DIR}/progress.log) )) ; then
+
+    for seqfile in ${START_SEQ_DIR}/*."${FQEXTENSION}"; do
+        # 3.1 extract the base name by removing .fastq
+        base=$(basename $seqfile ."${FQEXTENSION}")
+        echo "Step 3: " $base
+        outstatfile=$(echo $base".seqlenqual.txt")
+        # 3.2 extract read name, size, mean quality, add mapping information : mtDNA or nuclear and barcode of origin
+        mtDNA_id_infile=$(echo ${MAPPING_DIR}/$base.matchmtDNA.ids)
+        bioawk -v match_file="$mtDNA_id_infile" -c fastx 'BEGIN {while ((getline k <match_file)>0)i[k]=1} {if(i[$name]) print $name,"   ",length($seq)," ",meanqual($qual)," mtDNA"; else print $name," ",length($seq)," ",meanqual($qual)," nucDNA"}' $seqfile | sed - e "s/$/ $base/" > ${READS_STATS_DIR}/$outstatfile
+        # 3.3 extract mtDNA readname and read sequence
+        outmtreadfile=$(echo $base".mtDNA.fastq")
+        seqtk subseq $seqfile $mtDNA_id_infile > $READS_MTDNA_DIR/$outmtreadfile
+    done
+
+# Logging progress
+echo "Step3.3 completed" >> ${PROJECT_DIR}/progress.log
+fi
 
 # Step 4: Long mtDNA reads dir
 # Preparation of the directory
@@ -408,30 +454,38 @@ export LONG_MTDNA_READS_DIR=${PROJECT_DIR}/starting_raw_seq_long_mtDNA_reads_dir
 fi
 
 # Identification of the long mtDNA reads using a filtering step on the alignments with htsbox
-# We use a criteria of half of the mtDNA genome
-MTDNA_LENGTH=$(bioawk -c fastx '{print length($seq)}' $MY_MTDNA_REF)
-let SIZE_CUTOFF="$MTDNA_LENGTH/2"
 
-for bamfile in ${MAPPING_DIR}/*.sorted.bam; do
-    base=$(basename $bamfile .sorted.bam)
+if ! (( $(grep -c "Step4 completed" ${PROJECT_DIR}/progress.log) )) ; then
 
-    # We use a awk command to select long mtDNA reads
-    ${MY_HTSBOX} samview -p $bamfile | awk -v cutoff=$SIZE_CUTOFF -v mt_ref_acc=$MTDNA_REF_ACC '(($6 ~ mt_ref_acc ) && ($10 > cutoff)) {print $1,$2,$10,$10/$11}' > ${LONG_MTDNA_READS_DIR}/$base.long_mtDNA_reads.info
-    nb=$(wc -l ${LONG_MTDNA_READS_DIR}/$base.long_mtDNA_reads.info|awk '{print $1}')
-    echo "Found $nb long mtDNA reads in $base"
-done
 
-for long_mtDNA_read_ids_file in ${LONG_MTDNA_READS_DIR}/*.long_mtDNA_reads.info; do
-    base=$(basename $long_mtDNA_read_ids_file .long_mtDNA_reads.info)
-    echo "Step 4: " $base
+    # We use a criteria of half of the mtDNA genome
+    MTDNA_LENGTH=$(bioawk -c fastx '{print length($seq)}' $MY_MTDNA_REF)
+    let SIZE_CUTOFF="$MTDNA_LENGTH/2"
 
-    awk '{print $1}' $long_mtDNA_read_ids_file > ${LONG_MTDNA_READS_DIR}/$base.long_mtDNA_reads.ids
-    long_mtDNA_id_infile=$(echo "${LONG_MTDNA_READS_DIR}/$base.long_mtDNA_reads.ids")
-    bioawk -v match_file=$long_mtDNA_id_infile -v match_length=$MTDNA_LENGTH -c fastx 'BEGIN {while ((getline k <match_file)>0)i[k]=1} {if((i[$name])&&(length($seq)<=match_length)) print ">"$name,length($seq),"\n"$seq;}' ${START_SEQ_DIR}/$base.fastq > ${LONG_MTDNA_READS_DIR}/$base.small.long_mtDNA_reads.fasta
-    count_small_long_mtDNA_reads=$(grep -c '>' ${LONG_MTDNA_READS_DIR}/$base.small.long_mtDNA_reads.fasta)
-    bioawk -v match_file=$long_mtDNA_id_infile -v match_length=$MTDNA_LENGTH -c fastx 'BEGIN {while ((getline k <match_file)>0)i[k]=1} {if((i[$name])&&(length($seq)>=match_length)) print ">"$name,length($seq),"\n"$seq;}' ${START_SEQ_DIR}/$base.fastq > ${LONG_MTDNA_READS_DIR}/$base.very.long_mtDNA_reads.fasta
-    count_very_long_mtDNA_reads=`grep -c '>' ${LONG_MTDNA_READS_DIR}/$base.very.long_mtDNA_reads.fasta`
-done
+    for bamfile in ${MAPPING_DIR}/*.sorted.bam; do
+        base=$(basename $bamfile .sorted.bam)
+
+        # We use a awk command to select long mtDNA reads
+        ${MY_HTSBOX} samview -p $bamfile | awk -v cutoff=$SIZE_CUTOFF -v mt_ref_acc=$MTDNA_REF_ACC '(($6 ~ mt_ref_acc ) && ($10 > cutoff))  {print $1,$2,$10,$10/$11}' > ${LONG_MTDNA_READS_DIR}/$base.long_mtDNA_reads.info
+        nb=$(wc -l ${LONG_MTDNA_READS_DIR}/$base.long_mtDNA_reads.info|awk '{print $1}')
+        echo "Found $nb long mtDNA reads in $base"
+    done
+
+    for long_mtDNA_read_ids_file in ${LONG_MTDNA_READS_DIR}/*.long_mtDNA_reads.info; do
+        base=$(basename $long_mtDNA_read_ids_file .long_mtDNA_reads.info)
+        echo "Step 4: " $base
+
+        awk '{print $1}' $long_mtDNA_read_ids_file > ${LONG_MTDNA_READS_DIR}/$base.long_mtDNA_reads.ids
+        long_mtDNA_id_infile=$(echo "${LONG_MTDNA_READS_DIR}/$base.long_mtDNA_reads.ids")
+        bioawk -v match_file=$long_mtDNA_id_infile -v match_length=$MTDNA_LENGTH -c fastx 'BEGIN {while ((getline k <match_file)>0)i[k]=1}  {if((i[$name])&&(length($seq)<=match_length)) print ">"$name,length($seq),"\n"$seq;}' ${START_SEQ_DIR}/$base.fastq > $  {LONG_MTDNA_READS_DIR}/$base.small.long_mtDNA_reads.fasta
+        count_small_long_mtDNA_reads=$(grep -c '>' ${LONG_MTDNA_READS_DIR}/$base.small.long_mtDNA_reads.fasta)
+        bioawk -v match_file=$long_mtDNA_id_infile -v match_length=$MTDNA_LENGTH -c fastx 'BEGIN {while ((getline k <match_file)>0)i[k]=1}  {if((i[$name])&&(length($seq)>=match_length)) print ">"$name,length($seq),"\n"$seq;}' ${START_SEQ_DIR}/$base.fastq > $  {LONG_MTDNA_READS_DIR}/$base.very.long_mtDNA_reads.fasta
+        count_very_long_mtDNA_reads=`grep -c '>' ${LONG_MTDNA_READS_DIR}/$base.very.long_mtDNA_reads.fasta`
+    done
+
+    # Logging progress
+    echo "Step4 completed" >> ${PROJECT_DIR}/progress.log
+fi
 
 # Comparison of mtDNA to long mtDNA reads
 # the final aim will be to plot long mtDNA read size vs alignment length
@@ -443,27 +497,32 @@ done
 mkdir -p ${MAPPING_REF_DIR}/medaka_dir
 export MEDAKA_FOLDERS_DIR=${MAPPING_REF_DIR}/medaka_dir
 
-cd ${START_SEQ_DIR};
-for seqfile in "${START_SEQ_DIR}"/*."${FQEXTENSION}"; do
-    # 5.1 extract the base name by removing fastq
-    base=$(basename $seqfile .fastq)
-echo "Step 5: " $base
-    outmapfile=$(echo $base".mtDNA.aln.sam")
-    bamfile=$(echo $base".mtDNA.sorted.bam")
-    medaka_out=$(echo $base".medaka_variant")
-    # 5.2 run minimap2 using --secondary=no to suppress multiple mappings
-    ${MY_MINIMAP2} --secondary=no -t 48 -ax map-ont $MY_MTDNA_REF $mtdna_ref $seqfile > ${MAPPING_REF_DIR}/$outmapfile
+if ! (( $(grep -c "Step5.5 completed" ${PROJECT_DIR}/progress.log) )) ; then
 
-    # 5.3 Convert to sorted bam files and indexing
-    ${MY_SAMTOOLS} sort ${MAPPING_REF_DIR}/$outmapfile -o ${MAPPING_REF_DIR}/$bamfile -T reads.tmp
-    ${MY_SAMTOOLS} index ${MAPPING_REF_DIR}/$bamfile
+    cd ${START_SEQ_DIR};
+    for seqfile in $READS_MTDNA_DIR/*.mtDNA.fastq; do
+        # 5.1 extract the base name
+        base=$(basename $seqfile .mtDNA.fastq)
+        echo "Step 5: Mapping to mitochondrial reference alone " $base
+        outmapfile=$(echo $base".mtDNA.aln.sam")
+        bamfile=$(echo $base".mtDNA.sorted.bam")
+        medaka_out=$(echo $base".medaka_variant")
+        # 5.2 run minimap2 using --secondary=no to suppress multiple mappings
+        ${MY_MINIMAP2} --secondary=no -t 48 -ax map-ont $MY_MTDNA_REF $seqfile > ${MAPPING_REF_DIR}/$outmapfile
 
-    # 5.4 Deleting the intermediary sam output file
-    rm ${MAPPING_REF_DIR}/$outmapfile
+        # 5.3 Convert to sorted bam files and indexing
+        ${MY_SAMTOOLS} sort ${MAPPING_REF_DIR}/$outmapfile -o ${MAPPING_REF_DIR}/$bamfile -T reads.tmp
+        ${MY_SAMTOOLS} index ${MAPPING_REF_DIR}/$bamfile
 
-    # 5.5 Running medaka_variant to call phased variants (SNPs, indels); without keeping intermediary files
-    ${MY_MEDAKA} -f $MY_MTDNA_REF -i ${MAPPING_REF_DIR}/$bamfile -o ${MEDAKA_FOLDERS_DIR}/$medaka_out -p -d -t 12
-done
+        # 5.4 Deleting the intermediary sam output file
+        rm ${MAPPING_REF_DIR}/$outmapfile
+
+        # 5.5 Running medaka_variant to call phased variants (SNPs, indels); without keeping intermediary files
+        ${MY_MEDAKA} -f $MY_MTDNA_REF -i ${MAPPING_REF_DIR}/$bamfile -o ${MEDAKA_FOLDERS_DIR}/$medaka_out -d -t 12
+    done
+    # Logging progress
+    echo "Step5.5 completed" >> ${PROJECT_DIR}/progress.log
+fi
 
 # 5.6 Edit Sample information and rename individual vcf files
 # Create a directory for output files
@@ -475,7 +534,7 @@ for medaka_folders in ${MEDAKA_FOLDERS_DIR}/*.medaka_variant; do
 
 #HERE
 sample_id=`echo $medaka_base|sed -e s'/.medaka_variant_/XENMITO_/' -e 's/barcode/BARCODE/'`
-    sed -e "s/SAMPLE/$sample_id/" $medaka_folders/round_1_phased.vcf | vcf-annotate -f + -H > ${MEDAKA_FOLDERS_DIR}/final_vcf_dir/$medaka_base.vcf
+    sed -e "s/SAMPLE/$sample_id/" $medaka_folders/round_2_final_phased.vcf | vcf-annotate -f + -H > ${MEDAKA_FOLDERS_DIR}/final_vcf_dir/$medaka_base.vcf
     # Customize the awk command to suit your samples id names
 awk -v samplid=$sample_id -v mt_dna_acc=$MTDNA_REF_ACC 'BEGIN{startmt="^mt_dna_acc"} $1 ~ startmt { print $2," ",$6," ",samplid}' ${MEDAKA_FOLDERS_DIR}/final_vcf_dir/$medaka_base.vcf > ${MEDAKA_FOLDERS_DIR}/final_vcf_dir/$medaka_base.qual_stats.txt
 done
@@ -488,5 +547,6 @@ for individual_vcf_files in ${MEDAKA_FOLDERS_DIR}/final_vcf_dir/*.vcf; do
     bgzip $individual_vcf_files
     tabix -p vcf $individual_vcf_files.gz
 done
+
 
 ```
